@@ -1,0 +1,22 @@
+# 敏感配置（绝对不能上传）
+.env
+
+# 运行时生成的文件
+processed.json
+distilled.log
+*.log
+
+# 每天生成的文章文件
+*.pdf
+*.docx
+*.epub
+*.html
+_tmp.html
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
