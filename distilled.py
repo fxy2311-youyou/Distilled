@@ -247,8 +247,8 @@ def select_best_video(youtube, processed_ids):
         log.info(f"  ✓ {v['score']:.0f}pts  {v['duration_minutes']:.0f}min  {v['title']}  [{v['channel_name']}]")
 
     if not candidates:
-        return None
-    return max(candidates, key=lambda x: x['score'])
+        return []
+    return sorted(candidates, key=lambda x: x['score'], reverse=True)
 
 
 # ─── 字幕提取 ──────────────────────────────────────────────────────────────────
@@ -380,9 +380,13 @@ def generate_filename(article_text):
 
 
 EMAIL_PROMPT = """\
-你是一位洞察人心的文案高手。根据下面的文章和视频评论，生成邮件素材。
+你是一位洞察人心的文案高手。根据下面的文章、视频信息和评论，生成邮件素材。
 
 严格按以下格式输出，每个区块用 ===区块名=== 标记：
+
+===背景===
+第一段（2-3句）：介绍视频中的主讲人/受访者/采访者是谁，有什么背景，为什么值得现在听他说话。
+第二段（2-3句）：介绍频道"{channel}"是什么定位、关注什么领域、为什么值得长期关注。
 
 ===金句===
 列出3条最有传播力的金句：
@@ -393,17 +397,14 @@ EMAIL_PROMPT = """\
 **[标题]**
 [2-3句话描述]
 
-===一句话===
-列出3条25字以内的精华，适合做图片卡片：
-• [内容]
-
 ===评论===
-基于下方真实评论，总结3-4个讨论最热烈的话题，每个格式：
-**[话题标题]**
-[1-2句话概括讨论焦点]
+从下方评论中选出3-4条最有代表性的，每条格式：
 ❝ [原评论原文（英文）]（译：[中文翻译]）
 
 ===END===
+
+视频标题：{video_title}
+频道：{channel}
 
 文章内容：
 {article}
@@ -414,9 +415,14 @@ EMAIL_PROMPT = """\
 """
 
 
-def generate_email_content(article_text, comments=None):
+def generate_email_content(article_text, comments=None, video_title='', channel_name=''):
     comments_text = '\n'.join(f'• {c}' for c in (comments or [])[:30]) or '（暂无评论数据）'
-    return call_gemini(EMAIL_PROMPT.format(article=article_text[:8000], comments=comments_text))
+    return call_gemini(EMAIL_PROMPT.format(
+        article=article_text[:8000],
+        comments=comments_text,
+        video_title=video_title,
+        channel=channel_name,
+    ))
 
 
 # ─── HTML 构建 ─────────────────────────────────────────────────────────────────
@@ -546,7 +552,7 @@ def make_pdf(html_content, output_path):
         browser.close()
 
 
-def make_epub(article_text, title, video_url, channel_name, date_str, thumbnail_bytes=None):
+def make_epub(article_text, title, video_url, channel_name, date_str, thumbnail_bytes=None, video_original_title=''):
     _, intro, body_lines = '', '', []
     for raw in article_text.split('\n'):
         line = raw.strip()
@@ -583,11 +589,17 @@ def make_epub(article_text, title, video_url, channel_name, date_str, thumbnail_
             i += 1
     intro_html = f'<p class="intro">{fmt(intro)}</p>' if intro else ''
 
+    orig_title_html = (
+        f'<p class="orig-title">原视频：{html.escape(video_original_title)}</p>'
+        if video_original_title else ''
+    )
+
     xhtml = f"""<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh"><head>
 <meta charset="utf-8"/><title>{title}</title>
 <style>body{{font-family:Georgia,serif;font-size:1em;line-height:1.9;color:#1a1a1a}}
 h1{{font-size:1.45em;line-height:1.35;margin-bottom:.2em}}
+p.orig-title{{font-size:.85em;color:#888;font-style:italic;margin:.3em 0 .2em}}
 p.meta{{font-size:.8em;color:#999;font-style:italic;margin-bottom:2em}}
 p.intro{{font-style:italic;color:#555;border-left:3px solid #c8a96e;padding-left:1em;margin:1.5em 0}}
 p{{margin:0 0 1.1em;text-align:justify}}hr{{border:none;border-top:1px solid #ddd;margin:1.8em auto;width:40%}}
@@ -596,6 +608,7 @@ blockquote p{{margin:0;font-style:italic}}
 blockquote p.bq-trans{{font-style:normal;font-size:.88em;color:#999;margin-top:.4em}}</style>
 </head><body>
 <h1>{title}</h1>
+{orig_title_html}
 <p class="meta">{channel_name} · {date_str} · <a href="{video_url}">原视频</a></p>
 {intro_html}{body_html}
 </body></html>"""
@@ -720,8 +733,7 @@ def word_content_to_html(word_content):
     display = [
         ('金句',   '最有传播力的金句'),
         ('故事',   '最有共鸣的故事'),
-        ('一句话', '一句话精华'),
-        ('评论',   '评论区最热话题'),
+        ('评论',   '评论精选'),
     ]
 
     H3 = ('font-family:sans-serif;font-size:10px;font-weight:600;letter-spacing:.15em;'
@@ -767,25 +779,51 @@ def _fmt_num(n):
 
 def send_email(epub_bytes, article_title, video_url,
                channel_name, date_str, base_filename, word_content='',
-               like_count=0, view_count=0):
+               like_count=0, view_count=0, video_title='', published_at=''):
     msg = MIMEMultipart()
     msg['From']    = GMAIL_USER
     msg['To']      = RECIPIENT_EMAIL
     msg['Subject'] = f'📖 Distilled · {date_str} · {article_title}'
 
-    word_html    = word_content_to_html(word_content) if word_content else ''
-    safe_title   = html.escape(article_title)
-    safe_channel = html.escape(channel_name)
+    word_html        = word_content_to_html(word_content) if word_content else ''
+    safe_title       = html.escape(article_title)
+    safe_channel     = html.escape(channel_name)
+    safe_video_title = html.escape(video_title)
+    pub_date         = published_at[:10] if published_at else ''
+
+    # 提取背景介绍段落
+    bg_lines, in_bg = [], False
+    for line in word_content.split('\n'):
+        line = line.strip()
+        if line == '===背景===':
+            in_bg = True
+        elif re.match(r'^===\S+===$', line):
+            in_bg = False
+        elif in_bg and line and line != 'END':
+            bg_lines.append(line)
+    bg_html = ''.join(
+        f'<p style="margin:0 0 10px;color:#444;font-size:14px;line-height:1.8">{html.escape(l)}</p>'
+        for l in bg_lines
+    )
+    bg_block = (
+        '<div style="background:#fff;margin-top:2px;padding:20px 40px 24px;border-top:1px solid #ede8df">'
+        '<p style="font-family:sans-serif;font-size:10px;font-weight:600;letter-spacing:.15em;'
+        'text-transform:uppercase;color:#c8a96e;margin:0 0 12px">关于这期视频</p>'
+        f'{bg_html}</div>'
+    ) if bg_html else ''
 
     body = f"""<div style="font-family:'Noto Serif SC',Georgia,serif;max-width:660px;margin:0 auto;background:#f7f4ef">
   <!-- 头部 -->
   <div style="background:#fff;padding:36px 40px 28px">
     <p style="font-family:sans-serif;font-size:10px;color:#bbb;letter-spacing:.15em;text-transform:uppercase;margin:0 0 14px">DISTILLED · {date_str}</p>
     <h2 style="font-size:1.4em;font-weight:700;line-height:1.35;margin:0 0 10px;color:#111">{safe_title}</h2>
-    <p style="color:#999;font-family:sans-serif;font-size:12px;margin:0 0 6px">{safe_channel}</p>
+    <p style="color:#999;font-family:sans-serif;font-size:12px;margin:0 0 4px">{safe_channel}{f' &nbsp;·&nbsp; 发布于 {pub_date}' if pub_date else ''}</p>
+    {'<p style="color:#bbb;font-family:sans-serif;font-size:11px;margin:0 0 12px;font-style:italic">原视频：' + safe_video_title + '</p>' if video_title else ''}
     <p style="font-family:sans-serif;font-size:11px;color:#bbb;margin:0 0 18px">👍 {_fmt_num(like_count)} &nbsp;·&nbsp; 👁 {_fmt_num(view_count)}</p>
     <a href="{video_url}" style="font-family:sans-serif;color:#c8a96e;font-size:12px;text-decoration:none;border-bottom:1px solid #c8a96e;padding-bottom:1px">▶ 观看原视频</a>
   </div>
+  <!-- 背景介绍 -->
+  {bg_block}
   <!-- 传播素材 -->
   <div style="background:#fff;margin-top:2px;padding:8px 40px 36px">
     {word_html}
@@ -834,23 +872,29 @@ def main():
     youtube   = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
     date_str  = datetime.date.today().strftime('%Y-%m-%d')
 
-    # 1. 选视频
-    video = select_best_video(youtube, processed)
-    if not video:
+    # 1. 选视频（返回排序后的候选列表）
+    candidates = select_best_video(youtube, processed)
+    if not candidates:
         log.info('今天没有符合条件的新视频，结束。')
         return
 
-    log.info(f'选中：{video["title"]}  ({video["duration_minutes"]:.0f}min)')
+    # 2. 字幕（依次尝试候选视频，直到找到有英文字幕的）
+    video = None
+    transcript = None
+    for candidate in candidates:
+        log.info(f'尝试：{candidate["title"]}  ({candidate["duration_minutes"]:.0f}min)')
+        try:
+            transcript = get_transcript(candidate['id'])
+            video = candidate
+            log.info(f'字幕长度：{len(transcript)} 字符')
+            break
+        except RuntimeError as e:
+            log.warning(f'跳过（{e}）')
+            continue
 
-    # 2. 字幕
-    log.info('提取字幕…')
-    try:
-        transcript = get_transcript(video['id'])
-    except RuntimeError as e:
-        log.error(str(e))
-        log.info('无法获取字幕，今日跳过。')
+    if not video:
+        log.info('所有候选视频均无法获取字幕，今日结束。')
         return
-    log.info(f'字幕长度：{len(transcript)} 字符')
 
     # 3. 文章
     log.info('Gemini 生成文章…')
@@ -878,21 +922,23 @@ def main():
 
     # 7. EPUB（邮件用）
     log.info('生成 EPUB…')
-    epub_bytes = make_epub(article_text, article_title, video['url'], video['channel_name'], date_str, thumbnail_bytes)
+    epub_bytes = make_epub(article_text, article_title, video['url'], video['channel_name'], date_str, thumbnail_bytes, video['title'])
 
     # 8. 评论 + 邮件素材
     log.info('抓取视频评论…')
     comments = get_top_comments(youtube, video['id'])
     log.info(f'获取到 {len(comments)} 条评论')
     log.info('Gemini 生成邮件素材…')
-    email_content = generate_email_content(article_text, comments)
+    email_content = generate_email_content(article_text, comments, video['title'], video['channel_name'])
 
     # 9. 发邮件
     log.info('发送邮件…')
     send_email(epub_bytes, article_title, video['url'],
                video['channel_name'], date_str, base_filename, email_content,
                like_count=video.get('like_count', 0),
-               view_count=video.get('view_count', 0))
+               view_count=video.get('view_count', 0),
+               video_title=video['title'],
+               published_at=video.get('published_at', ''))
 
     # 10. 标记已处理
     processed.add(video['id'])
