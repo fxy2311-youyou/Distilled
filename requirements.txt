@@ -1,0 +1,7 @@
+google-api-python-client
+youtube-transcript-api
+google-genai
+python-dotenv
+playwright
+ebooklib
+python-docx
